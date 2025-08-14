@@ -1,0 +1,40 @@
+services:
+  minio:
+    image: minio/minio:latest
+    container_name: s4-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+
+  minio-setup:
+    image: minio/mc:latest
+    container_name: s4-minio-setup
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      sleep 10;
+      /usr/bin/mc alias set myminio http://minio:9000 minioadmin minioadmin123;
+      /usr/bin/mc mb myminio/test-bucket --ignore-existing;
+      /usr/bin/mc mb myminio/documents --ignore-existing;
+      /usr/bin/mc mb myminio/images --ignore-existing;
+      echo 'Hello World from S4!' | /usr/bin/mc pipe myminio/test-bucket/hello.txt;
+      echo 'This is a sample document for testing S4 TUI utility.' | /usr/bin/mc pipe myminio/documents/readme.txt;
+      echo 'Sample configuration file content' | /usr/bin/mc pipe myminio/documents/config.json;
+      /usr/bin/mc cp /usr/bin/mc myminio/test-bucket/mc-binary;
+      echo 'Setup completed successfully!';
+      "
+
+volumes:
+  minio_data:
