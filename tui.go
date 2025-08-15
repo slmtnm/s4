@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -21,6 +22,8 @@ const (
 	ViewPreview
 	ViewHelp
 	ViewUpload
+	ViewRename
+	ViewConfirm
 )
 
 // LocalItem represents a local file or directory
@@ -28,6 +31,14 @@ type LocalItem struct {
 	Name  string
 	IsDir bool
 	Size  int64
+}
+
+// DirStats holds cached directory statistics
+type DirStats struct {
+	Size         int64
+	LastModified string
+	SizeTimeout  bool
+	DateTimeout  bool
 }
 
 // Model represents the application state
@@ -50,6 +61,15 @@ type Model struct {
 	loading         bool
 	width           int
 	height          int
+	yankedFiles     []string // Keys of files that have been yanked for copying
+	renameInput     string   // Current input for renaming
+	renameOriginal  string   // Original filename being renamed
+	renameCursor    int      // Cursor position in rename input
+	scrollOffset    int      // Current scroll offset for file list
+	confirmAction   string   // Action being confirmed (delete, download, upload)
+	confirmTarget   string   // Target file/path for confirmation
+	confirmData     interface{} // Additional data for confirmation action
+	dirStatsCache   map[string]DirStats // Cache for directory statistics
 }
 
 // Messages for async operations
@@ -79,6 +99,18 @@ type fileDeletedMsg struct {
 	err      error
 }
 
+type fileCopiedMsg struct {
+	sourceKey string
+	destKey   string
+	err       error
+}
+
+type fileRenamedMsg struct {
+	oldKey string
+	newKey string
+	err    error
+}
+
 type statusMsg struct {
 	message string
 	isError bool
@@ -92,6 +124,14 @@ type localFilesLoadedMsg struct {
 
 type errorMsg struct {
 	err error
+}
+
+type dirStatsMsg struct {
+	dirKey       string
+	size         int64
+	lastModified string
+	sizeTimeout  bool
+	dateTimeout  bool
 }
 
 // Styles - Minimalistic theme
@@ -146,13 +186,14 @@ var (
 // NewModel creates a new TUI model
 func NewModel(s3Client *S3Client, bucket string) Model {
 	return Model{
-		s3Client:    s3Client,
-		bucket:      bucket,
-		currentPath: "",
-		objects:     []S3Object{},
-		cursor:      0,
-		viewMode:    ViewBrowser,
-		loading:     true,
+		s3Client:      s3Client,
+		bucket:        bucket,
+		currentPath:   "",
+		objects:       []S3Object{},
+		cursor:        0,
+		viewMode:      ViewBrowser,
+		loading:       true,
+		dirStatsCache: make(map[string]DirStats),
 	}
 }
 
@@ -179,6 +220,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateHelp(msg)
 		case ViewUpload:
 			return m.updateUpload(msg)
+		case ViewRename:
+			return m.updateRename(msg)
+		case ViewConfirm:
+			return m.updateConfirm(msg)
 		}
 
 	case objectsLoadedMsg:
@@ -188,7 +233,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.objects = msg.objects
 			m.cursor = 0
+			m.scrollOffset = 0
 			m.err = nil
+			
+			// Trigger directory stats calculations for directories that don't have cached stats
+			var cmds []tea.Cmd
+			for _, obj := range m.objects {
+				if obj.IsDir {
+					if _, exists := m.dirStatsCache[obj.Key]; !exists {
+						cmds = append(cmds, m.calculateDirStats(obj.Key))
+					}
+				}
+			}
+			if len(cmds) > 0 {
+				return m, tea.Batch(cmds...)
+			}
 		}
 		return m, nil
 
@@ -255,6 +314,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case fileCopiedMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.err = msg.err
+			m.statusMessage = ""
+		} else {
+			m.err = nil
+			// Handle both single file and multiple file copy messages
+			if strings.Contains(msg.sourceKey, "files") {
+				// Multiple files copied
+				m.statusMessage = fmt.Sprintf("✓ Copied %s successfully", msg.sourceKey)
+			} else {
+				// Single file copied (legacy support)
+				sourceFilename := filepath.Base(msg.sourceKey)
+				destFilename := filepath.Base(msg.destKey)
+				m.statusMessage = fmt.Sprintf("✓ Copied '%s' to '%s' successfully", sourceFilename, destFilename)
+			}
+			// Refresh the directory to show the new file(s)
+			return m, m.loadObjects()
+		}
+		return m, nil
+
+	case fileRenamedMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.err = msg.err
+			m.statusMessage = ""
+		} else {
+			m.err = nil
+			oldFilename := filepath.Base(msg.oldKey)
+			newFilename := filepath.Base(msg.newKey)
+			m.statusMessage = fmt.Sprintf("✓ Renamed '%s' to '%s' successfully", oldFilename, newFilename)
+			// Refresh the directory to show the renamed file
+			return m, m.loadObjects()
+		}
+		return m, nil
+
 	case statusMsg:
 		if msg.isError {
 			m.err = fmt.Errorf(msg.message)
@@ -268,6 +364,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case errorMsg:
 		m.err = msg.err
 		m.loading = false
+		return m, nil
+
+	case dirStatsMsg:
+		// Update directory statistics cache
+		stats := DirStats{
+			Size:         msg.size,
+			LastModified: msg.lastModified,
+			SizeTimeout:  msg.sizeTimeout,
+			DateTimeout:  msg.dateTimeout,
+		}
+		m.dirStatsCache[msg.dirKey] = stats
 		return m, nil
 	}
 
@@ -283,11 +390,13 @@ func (m Model) updateBrowser(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "up", "k":
 		if m.cursor > 0 {
 			m.cursor--
+			m.updateScroll()
 		}
 
 	case "down", "j":
 		if m.cursor < len(m.objects)-1 {
 			m.cursor++
+			m.updateScroll()
 		}
 
 	case "enter", "l", "o":
@@ -297,6 +406,8 @@ func (m Model) updateBrowser(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				// Navigate into directory
 				m.currentPath = selected.Key
 				m.loading = true
+				// Clear directory stats cache when navigating to ensure fresh calculations
+				m.dirStatsCache = make(map[string]DirStats)
 				return m, m.loadObjects()
 			} else {
 				// Preview file
@@ -314,20 +425,35 @@ func (m Model) updateBrowser(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.currentPath = ""
 			}
 			m.loading = true
+			// Clear directory stats cache when navigating to ensure fresh calculations
+			m.dirStatsCache = make(map[string]DirStats)
 			return m, m.loadObjects()
 		}
 
 	case "r":
-		// Refresh current directory
-		m.loading = true
-		return m, m.loadObjects()
-
-	case "d":
-		// Download selected file
+		// Rename selected file
 		if len(m.objects) > 0 {
 			selected := m.objects[m.cursor]
 			if !selected.IsDir {
-				return m, m.downloadFile(selected.Key)
+				m.renameOriginal = selected.Key
+				m.renameInput = filepath.Base(selected.Key)
+				m.renameCursor = len(m.renameInput) // Set cursor at end
+				m.viewMode = ViewRename
+				m.err = nil
+				m.statusMessage = ""
+			}
+		}
+
+	case "d":
+		// Download selected file (with confirmation)
+		if len(m.objects) > 0 {
+			selected := m.objects[m.cursor]
+			if !selected.IsDir {
+				m.confirmAction = "download"
+				m.confirmTarget = selected.Key
+				m.viewMode = ViewConfirm
+				m.err = nil
+				m.statusMessage = ""
 			}
 		}
 
@@ -336,12 +462,116 @@ func (m Model) updateBrowser(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.uploadFilePrompt()
 
 	case "x":
-		// Delete selected file
+		// Delete selected file (with confirmation)
 		if len(m.objects) > 0 {
 			selected := m.objects[m.cursor]
 			if !selected.IsDir {
-				return m, m.deleteFile(selected.Key)
+				m.confirmAction = "delete"
+				m.confirmTarget = selected.Key
+				m.viewMode = ViewConfirm
+				m.err = nil
+				m.statusMessage = ""
 			}
+		}
+
+	case "y":
+		// Yank (mark for copying) selected file - toggle behavior
+		if len(m.objects) > 0 {
+			selected := m.objects[m.cursor]
+			if !selected.IsDir {
+				// Check if file is already yanked
+				isYanked := false
+				yankedIndex := -1
+				for i, yankedKey := range m.yankedFiles {
+					if yankedKey == selected.Key {
+						isYanked = true
+						yankedIndex = i
+						break
+					}
+				}
+
+				if isYanked {
+					// Remove from yanked files
+					m.yankedFiles = append(m.yankedFiles[:yankedIndex], m.yankedFiles[yankedIndex+1:]...)
+				} else {
+					// Add to yanked files
+					m.yankedFiles = append(m.yankedFiles, selected.Key)
+				}
+				m.err = nil
+
+				// Move cursor to next item
+				if m.cursor < len(m.objects)-1 {
+					m.cursor++
+					m.updateScroll()
+				}
+			}
+		}
+
+	case "p":
+		// Paste yanked files to current location
+		if len(m.yankedFiles) > 0 {
+			return m, m.pasteFiles()
+		}
+
+	case "c":
+		// Clear all yanked files
+		if len(m.yankedFiles) > 0 {
+			count := len(m.yankedFiles)
+			m.yankedFiles = []string{}
+			m.statusMessage = fmt.Sprintf("✓ Cleared %d yanked file(s)", count)
+			m.err = nil
+		}
+
+	case "g":
+		// Go to first item
+		if len(m.objects) > 0 {
+			m.cursor = 0
+			m.updateScroll()
+		}
+
+	case "G":
+		// Go to last item
+		if len(m.objects) > 0 {
+			m.cursor = len(m.objects) - 1
+			m.updateScroll()
+		}
+
+	case "ctrl+d":
+		// Page down (half screen)
+		if len(m.objects) > 0 {
+			availableHeight := m.height - 8
+			if availableHeight < 5 {
+				availableHeight = 5
+			}
+			pageSize := availableHeight / 2
+			if pageSize < 1 {
+				pageSize = 1
+			}
+
+			m.cursor += pageSize
+			if m.cursor >= len(m.objects) {
+				m.cursor = len(m.objects) - 1
+			}
+			m.updateScroll()
+		}
+
+	case "ctrl+u":
+		// Page up (half screen)
+		if len(m.objects) > 0 {
+			availableHeight := m.height - 8
+			if availableHeight < 5 {
+				availableHeight = 5
+			}
+			pageSize := availableHeight / 2
+			if pageSize < 1 {
+				pageSize = 1
+			}
+
+			m.cursor -= pageSize
+			if m.cursor < 0 {
+				m.cursor = 0
+			}
+			m.updateScroll()
 		}
 
 	case "?":
@@ -349,6 +579,44 @@ func (m Model) updateBrowser(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+// updateScroll adjusts scroll offset based on cursor position and screen size
+func (m *Model) updateScroll() {
+	if len(m.objects) == 0 {
+		m.scrollOffset = 0
+		return
+	}
+
+	// Calculate available height for file list
+	// Account for: title (2 lines), status/error (2 lines), help (2 lines), borders/padding
+	availableHeight := m.height - 8
+	if availableHeight < 5 {
+		availableHeight = 5 // Minimum reasonable height
+	}
+
+	scrollback := 2
+
+	// Scroll down if cursor is too close to bottom
+	if m.cursor >= m.scrollOffset+availableHeight-scrollback {
+		m.scrollOffset = m.cursor - availableHeight + scrollback + 1
+	}
+
+	// Scroll up if cursor is too close to top
+	if m.cursor < m.scrollOffset+scrollback {
+		m.scrollOffset = m.cursor - scrollback
+	}
+
+	// Ensure scroll offset stays within bounds
+	if m.scrollOffset < 0 {
+		m.scrollOffset = 0
+	}
+	if m.scrollOffset > len(m.objects)-availableHeight {
+		m.scrollOffset = len(m.objects) - availableHeight
+		if m.scrollOffset < 0 {
+			m.scrollOffset = 0
+		}
+	}
 }
 
 // updatePreview handles preview view updates
@@ -448,10 +716,14 @@ func (m Model) updateUpload(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				}
 				return m, m.loadLocalFiles(newPath)
 			} else {
-				// Upload file
+				// Upload file (with confirmation)
 				fullPath := filepath.Join(m.localPath, selected.Name)
-				m.viewMode = ViewBrowser
-				return m, m.uploadFile(fullPath)
+				m.confirmAction = "upload"
+				m.confirmTarget = selected.Name
+				m.confirmData = fullPath
+				m.viewMode = ViewConfirm
+				m.err = nil
+				m.statusMessage = ""
 			}
 		}
 	case "backspace", "h":
@@ -468,6 +740,144 @@ func (m Model) updateUpload(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateRename handles rename view updates
+func (m Model) updateRename(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q":
+		return m, tea.Quit
+	case "esc":
+		// Cancel rename
+		m.viewMode = ViewBrowser
+		m.renameInput = ""
+		m.renameOriginal = ""
+		m.renameCursor = 0
+		return m, nil
+	case "enter":
+		// Confirm rename
+		if m.renameInput != "" && m.renameInput != filepath.Base(m.renameOriginal) {
+			m.viewMode = ViewBrowser
+			m.loading = true
+			cmd := m.renameFile(m.renameOriginal, m.renameInput)
+			m.renameInput = ""
+			m.renameOriginal = ""
+			m.renameCursor = 0
+			return m, cmd
+		}
+		// If no change, just go back to browser
+		m.viewMode = ViewBrowser
+		m.renameInput = ""
+		m.renameOriginal = ""
+		m.renameCursor = 0
+		return m, nil
+	case "backspace":
+		// Remove character to the left of cursor
+		if m.renameCursor > 0 && len(m.renameInput) > 0 {
+			m.renameInput = m.renameInput[:m.renameCursor-1] + m.renameInput[m.renameCursor:]
+			m.renameCursor--
+		}
+	case "delete":
+		// Remove character at cursor position
+		if m.renameCursor < len(m.renameInput) {
+			m.renameInput = m.renameInput[:m.renameCursor] + m.renameInput[m.renameCursor+1:]
+		}
+	case "left":
+		// Move cursor left
+		if m.renameCursor > 0 {
+			m.renameCursor--
+		}
+	case "right":
+		// Move cursor right
+		if m.renameCursor < len(m.renameInput) {
+			m.renameCursor++
+		}
+	case "home", "ctrl+a":
+		// Go to beginning
+		m.renameCursor = 0
+	case "end", "ctrl+e":
+		// Go to end
+		m.renameCursor = len(m.renameInput)
+	case "ctrl+u":
+		// Delete all text to the left of cursor
+		m.renameInput = m.renameInput[m.renameCursor:]
+		m.renameCursor = 0
+	case "ctrl+w":
+		// Delete word to the left of cursor
+		if m.renameCursor > 0 {
+			// Find the start of the current word
+			start := m.renameCursor - 1
+			// Skip any trailing spaces
+			for start >= 0 && m.renameInput[start] == ' ' {
+				start--
+			}
+			// Find the beginning of the word
+			for start >= 0 && m.renameInput[start] != ' ' {
+				start--
+			}
+			start++ // Move to the first character of the word
+
+			// Delete from start to cursor
+			m.renameInput = m.renameInput[:start] + m.renameInput[m.renameCursor:]
+			m.renameCursor = start
+		}
+	default:
+		// Add character to input (only printable characters)
+		if len(msg.String()) == 1 && msg.String()[0] >= 32 && msg.String()[0] <= 126 {
+			// Insert character at cursor position
+			m.renameInput = m.renameInput[:m.renameCursor] + msg.String() + m.renameInput[m.renameCursor:]
+			m.renameCursor++
+		}
+	}
+
+	// Ensure cursor stays within bounds
+	if m.renameCursor < 0 {
+		m.renameCursor = 0
+	}
+	if m.renameCursor > len(m.renameInput) {
+		m.renameCursor = len(m.renameInput)
+	}
+
+	return m, nil
+}
+
+// updateConfirm handles confirmation view updates
+func (m Model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "ctrl+c", "q":
+		return m, tea.Quit
+	case "esc", "n", "N":
+		// Cancel confirmation
+		m.viewMode = ViewBrowser
+		m.confirmAction = ""
+		m.confirmTarget = ""
+		m.confirmData = nil
+		return m, nil
+	case "y", "Y", "enter":
+		// Confirm action
+		m.viewMode = ViewBrowser
+		m.loading = true
+		
+		var cmd tea.Cmd
+		switch m.confirmAction {
+		case "delete":
+			cmd = m.deleteFile(m.confirmTarget)
+		case "download":
+			cmd = m.downloadFile(m.confirmTarget)
+		case "upload":
+			if fullPath, ok := m.confirmData.(string); ok {
+				cmd = m.uploadFile(fullPath)
+			}
+		}
+		
+		// Clear confirmation state
+		m.confirmAction = ""
+		m.confirmTarget = ""
+		m.confirmData = nil
+		
+		return m, cmd
+	}
+	return m, nil
+}
+
 // View renders the current view
 func (m Model) View() string {
 	switch m.viewMode {
@@ -479,6 +889,10 @@ func (m Model) View() string {
 		return m.viewHelp()
 	case ViewUpload:
 		return m.viewUpload()
+	case ViewRename:
+		return m.viewRename()
+	case ViewConfirm:
+		return m.viewConfirm()
 	}
 	return ""
 }
@@ -491,6 +905,9 @@ func (m Model) viewBrowser() string {
 	title := fmt.Sprintf("Bucket: %s", m.bucket)
 	if m.currentPath != "" {
 		title += fmt.Sprintf(" | Path: /%s", m.currentPath)
+	}
+	if len(m.yankedFiles) > 0 {
+		title += fmt.Sprintf(" | Yanked: %d file(s)", len(m.yankedFiles))
 	}
 	s.WriteString(titleStyle.Render(title))
 	s.WriteString("\n\n")
@@ -512,21 +929,114 @@ func (m Model) viewBrowser() string {
 		if len(m.objects) == 0 {
 			s.WriteString("No objects found in this location.\n")
 		} else {
-			for i, obj := range m.objects {
+			// Update scroll position
+			m.updateScroll()
+
+			// Calculate available height for file list
+			availableHeight := m.height - 8
+			if availableHeight < 5 {
+				availableHeight = 5
+			}
+
+			// Calculate visible range
+			startIdx := m.scrollOffset
+			endIdx := startIdx + availableHeight
+			if endIdx > len(m.objects) {
+				endIdx = len(m.objects)
+			}
+
+			// Calculate dynamic filename width based on terminal width
+			maxSizeWidth := 8  // constant width for size column
+			dateWidth := 19    // constant width for date column (YYYY-MM-DD HH:MM:SS)
+			
+			// Calculate available space for filename column
+			// Account for: cursor (2), yank indicator (2), spaces between columns (6), size column (8), date column (19)
+			usedWidth := 2 + 2 + 6 + maxSizeWidth + dateWidth
+			availableWidth := m.width - usedWidth - 10 // Extra margin for borders and centering
+			
+			// Set reasonable bounds for filename width
+			maxNameWidth := availableWidth
+			if maxNameWidth < 15 {
+				maxNameWidth = 15 // Minimum usable width
+			}
+			if maxNameWidth > 60 {
+				maxNameWidth = 60 // Maximum to prevent overly wide tables
+			}
+
+			// Display visible items
+			for i := startIdx; i < endIdx; i++ {
+				obj := m.objects[i]
 				cursor := " "
 				if i == m.cursor {
 					cursor = ">"
 				}
 
-				var line string
+				name := filepath.Base(obj.Key)
 				if obj.IsDir {
-					name := filepath.Base(obj.Key) + "/"
-					line = fmt.Sprintf("%s %s", cursor, directoryStyle.Render(name))
-				} else {
-					name := filepath.Base(obj.Key)
-					size := formatSize(obj.Size)
-					line = fmt.Sprintf("%s %s (%s) %s", cursor, fileStyle.Render(name), size, obj.LastModified)
+					name += "/"
 				}
+				
+				// Always truncate name to fit dynamic width
+				displayName := name
+				if len(name) > maxNameWidth {
+					displayName = name[:maxNameWidth-3] + "..."
+				}
+
+				// Check if file is yanked (directories can't be yanked)
+				// Always reserve space for yank indicator to maintain consistent alignment
+				yankedIndicator := " " // Default: empty space
+				if !obj.IsDir {
+					for _, yankedKey := range m.yankedFiles {
+						if obj.Key == yankedKey {
+							yankedIndicator = lipgloss.NewStyle().Foreground(lipgloss.Color("#ffff00")).Render("●")
+							break
+						}
+					}
+				}
+
+				// Format with consistent column alignment for both files and directories
+				paddedName := fmt.Sprintf("%-*s", maxNameWidth, displayName)
+				
+				var paddedSize string
+				var displayDate string
+				
+				if obj.IsDir {
+					// Check if we have cached directory stats
+					if stats, exists := m.dirStatsCache[obj.Key]; exists {
+						if stats.SizeTimeout {
+							paddedSize = fmt.Sprintf("%*s", maxSizeWidth, "? B")
+						} else {
+							size := formatSize(stats.Size)
+							paddedSize = fmt.Sprintf("%*s", maxSizeWidth, size)
+						}
+						
+						if stats.DateTimeout {
+							displayDate = "N/A"
+						} else {
+							displayDate = stats.LastModified
+						}
+					} else {
+						// No cached stats, show placeholders and trigger calculation
+						paddedSize = fmt.Sprintf("%*s", maxSizeWidth, "...")
+						displayDate = "..."
+						// Note: We'll trigger calculation after the render loop
+					}
+				} else {
+					size := formatSize(obj.Size)
+					paddedSize = fmt.Sprintf("%*s", maxSizeWidth, size)
+					displayDate = obj.LastModified
+				}
+
+				// Apply styling based on type
+				var styledName string
+				if obj.IsDir {
+					styledName = directoryStyle.Render(paddedName)
+				} else {
+					styledName = fileStyle.Render(paddedName)
+				}
+
+				// Use consistent format for all items (always has yank indicator space reserved)
+				line := fmt.Sprintf("%s %s %s %s %s", cursor, yankedIndicator, styledName, paddedSize, displayDate)
 
 				if i == m.cursor {
 					line = selectedStyle.Render(line)
@@ -535,12 +1045,19 @@ func (m Model) viewBrowser() string {
 				s.WriteString(line)
 				s.WriteString("\n")
 			}
+
+			// Add scroll indicators if needed
+			if len(m.objects) > availableHeight {
+				scrollInfo := fmt.Sprintf("(%d-%d of %d)", startIdx+1, endIdx, len(m.objects))
+				s.WriteString(helpStyle.Render(scrollInfo))
+				s.WriteString("\n")
+			}
 		}
 	}
 
 	// Help text
 	s.WriteString("\n")
-	s.WriteString(helpStyle.Render("↑/k: up • ↓/j: down • ←/h: back • →/l/o/enter: select • d: download • u: upload • x: delete • r: refresh • ?: help • q: quit"))
+	s.WriteString(helpStyle.Render("?: help"))
 
 	// Wrap content in border and center it
 	content := s.String()
@@ -629,9 +1146,12 @@ func (m Model) viewHelp() string {
 	help := `Navigation:
   ↑/k         Move cursor up
   ↓/j         Move cursor down
+  ctrl+u      Page up (half screen)
+  ctrl+d      Page down (half screen)
+  g           Go to first item
+  G           Go to last item
   ←/h         Go back to parent directory
   →/l/o/enter Enter directory or preview file
-  r           Refresh current directory
 
 Actions:
   ?           Show this help
@@ -642,6 +1162,10 @@ File Operations:
   d           Download selected file to current directory
   u           Upload file from current directory
   x           Delete selected file from S3
+  y           Yank (mark) selected file for copying (toggle)
+  p           Paste all yanked files to current location
+  c           Clear all yanked files
+  r           Rename selected file
 
 Preview Navigation:
   ↑/k,↓/j     Scroll line by line
@@ -654,8 +1178,11 @@ Browser Features:
   - Preview text files in-place
   - Download files to local directory
   - Upload files from local directory
+  - Copy/paste files within the bucket
+  - Rename files with interactive popup
   - Shows file sizes and modification dates
   - Distinguishes directories from files
+  - Automatic name conflict resolution (adds _copy_N suffix)
 
 Configuration:
   S4 reads configuration from .s3cfg file in:
@@ -686,7 +1213,7 @@ func (m Model) viewUpload() string {
 	if absPath, err := filepath.Abs(m.localPath); err == nil {
 		displayPath = absPath
 	}
-	
+
 	title := fmt.Sprintf("Local: %s", displayPath)
 	if m.currentPath != "" {
 		title += fmt.Sprintf(" → S3: /%s", m.currentPath)
@@ -744,6 +1271,157 @@ func (m Model) viewUpload() string {
 		return verticalCenterStyle.Height(m.height).Render(centered)
 	}
 	return bordered
+}
+
+// viewRename renders the rename popup view
+func (m Model) viewRename() string {
+	var s strings.Builder
+
+	title := fmt.Sprintf("Rename: %s", filepath.Base(m.renameOriginal))
+	s.WriteString(titleStyle.Render(title))
+	s.WriteString("\n\n")
+
+	// Error display
+	if m.err != nil {
+		s.WriteString(errorStyle.Render(fmt.Sprintf("Error: %s", m.err.Error())))
+		s.WriteString("\n\n")
+	}
+
+	// Input field label
+	s.WriteString("New name:")
+	s.WriteString("\n")
+
+	// Create a simple input box style
+	inputStyle := lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder()).
+		BorderForeground(lipgloss.Color("#0066cc")).
+		Padding(0, 1).
+		Width(40)
+
+	// Render input with cursor
+	inputContent := m.renderInputWithCursor()
+
+	s.WriteString(inputStyle.Render(inputContent))
+	s.WriteString("\n\n")
+
+	// Instructions
+	s.WriteString(helpStyle.Render("enter: confirm • esc: cancel • ←/→: move cursor • ctrl+a/e: start/end • ctrl+u: clear left • ctrl+w: delete word"))
+
+	// Wrap content and center it
+	content := s.String()
+
+	// Create a popup-style border
+	popupStyle := lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(lipgloss.Color("#0066cc")).
+		Padding(2, 4).
+		Align(lipgloss.Center)
+
+	popup := popupStyle.Render(content)
+
+	// Center the popup on screen
+	if m.width > 0 && m.height > 0 {
+		centered := centerStyle.Width(m.width).Render(popup)
+		return verticalCenterStyle.Height(m.height).Render(centered)
+	}
+	return popup
+}
+
+// viewConfirm renders the confirmation popup view
+func (m Model) viewConfirm() string {
+	var s strings.Builder
+
+	// Create title based on action
+	var title, message string
+	filename := filepath.Base(m.confirmTarget)
+	
+	switch m.confirmAction {
+	case "delete":
+		title = "Confirm Delete"
+		message = fmt.Sprintf("Are you sure you want to delete '%s'?\n\nThis action cannot be undone.", filename)
+	case "download":
+		title = "Confirm Download"
+		message = fmt.Sprintf("Download '%s' to current directory?", filename)
+	case "upload":
+		title = "Confirm Upload"
+		if m.currentPath != "" {
+			message = fmt.Sprintf("Upload '%s' to S3 path '/%s'?", filename, m.currentPath)
+		} else {
+			message = fmt.Sprintf("Upload '%s' to S3 root?", filename)
+		}
+	default:
+		title = "Confirm Action"
+		message = "Are you sure?"
+	}
+
+	s.WriteString(titleStyle.Render(title))
+	s.WriteString("\n\n")
+
+	// Error display
+	if m.err != nil {
+		s.WriteString(errorStyle.Render(fmt.Sprintf("Error: %s", m.err.Error())))
+		s.WriteString("\n\n")
+	}
+
+	// Message
+	s.WriteString(message)
+	s.WriteString("\n\n")
+
+	// Instructions
+	s.WriteString(helpStyle.Render("y/enter: yes • n/esc: no"))
+
+	// Wrap content and center it
+	content := s.String()
+	
+	// Create a popup-style border (orange color for attention)
+	popupStyle := lipgloss.NewStyle().
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(lipgloss.Color("#cc6600")).
+		Padding(2, 4).
+		Align(lipgloss.Center)
+	
+	popup := popupStyle.Render(content)
+
+	// Center the popup on screen
+	if m.width > 0 && m.height > 0 {
+		centered := centerStyle.Width(m.width).Render(popup)
+		return verticalCenterStyle.Height(m.height).Render(centered)
+	}
+	return popup
+}
+
+// renderInputWithCursor renders the input text with a visible cursor
+func (m Model) renderInputWithCursor() string {
+	if len(m.renameInput) == 0 {
+		// Empty input, show cursor at beginning
+		return "█"
+	}
+
+	// Insert cursor character at cursor position
+	before := m.renameInput[:m.renameCursor]
+	after := m.renameInput[m.renameCursor:]
+
+	// Use a block cursor character
+	cursor := "█"
+
+	// If cursor is at the end, append cursor
+	if m.renameCursor >= len(m.renameInput) {
+		return m.renameInput + cursor
+	}
+
+	// If cursor is in the middle, replace the character at cursor position with highlighted version
+	if m.renameCursor < len(m.renameInput) {
+		// Create a highlighted version of the character under cursor
+		charUnderCursor := string(m.renameInput[m.renameCursor])
+		highlightedChar := lipgloss.NewStyle().
+			Background(lipgloss.Color("#ffffff")).
+			Foreground(lipgloss.Color("#000000")).
+			Render(charUnderCursor)
+
+		return before + highlightedChar + after[1:]
+	}
+
+	return before + cursor + after
 }
 
 // loadObjects loads objects from S3
@@ -807,8 +1485,8 @@ func (m Model) loadLocalFiles(path string) tea.Cmd {
 			return localFilesLoadedMsg{err: err}
 		}
 
-				var localItems []LocalItem
-		
+		var localItems []LocalItem
+
 		// Always add parent directory entry (allows going above starting directory)
 		localItems = append(localItems, LocalItem{
 			Name:  "..",
@@ -941,6 +1619,217 @@ func (m Model) calculatePreviewWidth() int {
 	}
 
 	return optimalWidth
+}
+
+// renameFile renames a file in S3
+func (m Model) renameFile(oldKey, newFilename string) tea.Cmd {
+	return tea.Cmd(func() tea.Msg {
+		// Construct the new key with the same path but new filename
+		var newKey string
+		if strings.Contains(oldKey, "/") {
+			// File is in a subdirectory
+			parts := strings.Split(oldKey, "/")
+			parts[len(parts)-1] = newFilename // Replace the filename
+			newKey = strings.Join(parts, "/")
+		} else {
+			// File is in root
+			newKey = newFilename
+		}
+
+		// Check if the new name already exists
+		for _, obj := range m.objects {
+			if obj.Key == newKey {
+				return fileRenamedMsg{err: fmt.Errorf("file '%s' already exists", newFilename)}
+			}
+		}
+
+		// Perform the rename operation (copy + delete)
+		err := m.s3Client.RenameObject(context.Background(), m.bucket, oldKey, newKey)
+		if err != nil {
+			return fileRenamedMsg{err: err}
+		}
+
+		// Update yanked files references if the renamed file was yanked
+		for i, yankedKey := range m.yankedFiles {
+			if yankedKey == oldKey {
+				m.yankedFiles[i] = newKey
+				break
+			}
+		}
+
+		return fileRenamedMsg{
+			oldKey: oldKey,
+			newKey: newKey,
+		}
+	})
+}
+
+// pasteFiles copies all yanked files to the current location
+func (m Model) pasteFiles() tea.Cmd {
+	return tea.Cmd(func() tea.Msg {
+		if len(m.yankedFiles) == 0 {
+			return fileCopiedMsg{err: fmt.Errorf("no files yanked for copying")}
+		}
+
+		var copiedFiles []string
+		var errors []string
+
+		for _, yankedFile := range m.yankedFiles {
+			// Get the filename from the yanked file
+			filename := filepath.Base(yankedFile)
+
+			// Construct destination key
+			var destKey string
+			if m.currentPath != "" {
+				destKey = m.currentPath + "/" + filename
+			} else {
+				destKey = filename
+			}
+
+			// Check if file already exists in current location
+			for _, obj := range m.objects {
+				if obj.Key == destKey {
+					// File exists, create a new name with suffix
+					ext := filepath.Ext(filename)
+					nameWithoutExt := strings.TrimSuffix(filename, ext)
+
+					// Find a unique name by adding numbers
+					counter := 1
+					for {
+						newFilename := fmt.Sprintf("%s_copy_%d%s", nameWithoutExt, counter, ext)
+						if m.currentPath != "" {
+							destKey = m.currentPath + "/" + newFilename
+						} else {
+							destKey = newFilename
+						}
+
+						// Check if this new name exists
+						exists := false
+						for _, existingObj := range m.objects {
+							if existingObj.Key == destKey {
+								exists = true
+								break
+							}
+						}
+						if !exists {
+							break
+						}
+						counter++
+					}
+					break
+				}
+			}
+
+			// Perform the copy operation
+			err := m.s3Client.CopyObject(context.Background(), m.bucket, yankedFile, destKey)
+			if err != nil {
+				errors = append(errors, fmt.Sprintf("%s: %v", filepath.Base(yankedFile), err))
+			} else {
+				copiedFiles = append(copiedFiles, filepath.Base(destKey))
+			}
+		}
+
+		// Return result with summary
+		if len(errors) > 0 {
+			errorMsg := fmt.Sprintf("Failed to copy %d file(s): %s", len(errors), strings.Join(errors, ", "))
+			if len(copiedFiles) > 0 {
+				errorMsg += fmt.Sprintf(". Successfully copied: %s", strings.Join(copiedFiles, ", "))
+			}
+			return fileCopiedMsg{err: fmt.Errorf(errorMsg)}
+		}
+
+		return fileCopiedMsg{
+			sourceKey: fmt.Sprintf("%d files", len(m.yankedFiles)),
+			destKey:   strings.Join(copiedFiles, ", "),
+		}
+	})
+}
+
+// calculateDirStats calculates directory statistics with timeouts
+func (m Model) calculateDirStats(dirKey string) tea.Cmd {
+	return tea.Cmd(func() tea.Msg {
+		prefix := dirKey
+		if prefix != "" && !strings.HasSuffix(prefix, "/") {
+			prefix += "/"
+		}
+
+		// Channel for size calculation
+		sizeChan := make(chan int64, 1)
+		sizeErrChan := make(chan error, 1)
+		
+		// Channel for last modified calculation
+		dateChan := make(chan string, 1)
+		dateErrChan := make(chan error, 1)
+
+		// Start size calculation goroutine
+		go func() {
+			objects, err := m.s3Client.ListObjects(context.Background(), m.bucket, prefix)
+			if err != nil {
+				sizeErrChan <- err
+				return
+			}
+
+			var totalSize int64
+			for _, obj := range objects {
+				if !obj.IsDir {
+					totalSize += obj.Size
+				}
+			}
+			sizeChan <- totalSize
+		}()
+
+		// Start date calculation goroutine
+		go func() {
+			objects, err := m.s3Client.ListObjects(context.Background(), m.bucket, prefix)
+			if err != nil {
+				dateErrChan <- err
+				return
+			}
+
+			var latestDate string
+			for _, obj := range objects {
+				if !obj.IsDir && (latestDate == "" || obj.LastModified > latestDate) {
+					latestDate = obj.LastModified
+				}
+			}
+			if latestDate == "" {
+				latestDate = "N/A"
+			}
+			dateChan <- latestDate
+		}()
+
+		// Wait for results with timeouts
+		var size int64 = 0
+		var lastModified string = "N/A"
+		var sizeTimeout bool = false
+		var dateTimeout bool = false
+
+		// Wait for size with 1-second timeout
+		select {
+		case size = <-sizeChan:
+		case <-sizeErrChan:
+			sizeTimeout = true
+		case <-time.After(1 * time.Second):
+			sizeTimeout = true
+		}
+
+		// Wait for date with 2-second timeout
+		select {
+		case lastModified = <-dateChan:
+		case <-dateErrChan:
+			dateTimeout = true
+		case <-time.After(2 * time.Second):
+			dateTimeout = true
+		}
+
+		return dirStatsMsg{
+			dirKey:       dirKey,
+			size:         size,
+			lastModified: lastModified,
+			sizeTimeout:  sizeTimeout,
+			dateTimeout:  dateTimeout,
+		}
+	})
 }
 
 // formatSize formats file size in human-readable format

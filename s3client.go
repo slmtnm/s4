@@ -145,6 +145,41 @@ func (c *S3Client) DeleteObject(ctx context.Context, bucket, key string) error {
 	return nil
 }
 
+// CopyObject copies an object within the same bucket
+func (c *S3Client) CopyObject(ctx context.Context, bucket, sourceKey, destKey string) error {
+	copySource := fmt.Sprintf("%s/%s", bucket, sourceKey)
+	
+	input := &s3.CopyObjectInput{
+		Bucket:     aws.String(bucket),
+		Key:        aws.String(destKey),
+		CopySource: aws.String(copySource),
+	}
+
+	_, err := c.client.CopyObject(ctx, input)
+	if err != nil {
+		return fmt.Errorf("failed to copy object: %w", err)
+	}
+
+	return nil
+}
+
+// RenameObject renames an object by copying it to the new key and deleting the old one
+func (c *S3Client) RenameObject(ctx context.Context, bucket, oldKey, newKey string) error {
+	// First, copy the object to the new key
+	err := c.CopyObject(ctx, bucket, oldKey, newKey)
+	if err != nil {
+		return fmt.Errorf("failed to copy object during rename: %w", err)
+	}
+
+	// Then delete the original object
+	err = c.DeleteObject(ctx, bucket, oldKey)
+	if err != nil {
+		return fmt.Errorf("failed to delete original object during rename: %w", err)
+	}
+
+	return nil
+}
+
 // HeadBucket checks if a bucket exists and is accessible
 func (c *S3Client) HeadBucket(ctx context.Context, bucket string) error {
 	input := &s3.HeadBucketInput{
