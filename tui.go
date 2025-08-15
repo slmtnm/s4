@@ -62,6 +62,7 @@ type Model struct {
 	width           int
 	height          int
 	yankedFiles     []string // Keys of files that have been yanked for copying
+	selectedFiles   []string // Keys of files/folders that have been selected for operations
 	renameInput     string   // Current input for renaming
 	renameOriginal  string   // Original filename being renamed
 	renameCursor    int      // Cursor position in rename input
@@ -97,6 +98,18 @@ type fileUploadedMsg struct {
 type fileDeletedMsg struct {
 	filename string
 	err      error
+}
+
+type folderDeletedMsg struct {
+	foldername   string
+	deletedCount int
+	err          error
+}
+
+type batchDeletedMsg struct {
+	deletedCount int
+	failedCount  int
+	err          error
 }
 
 type fileCopiedMsg struct {
@@ -314,6 +327,46 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case folderDeletedMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.err = msg.err
+			m.statusMessage = ""
+		} else {
+			m.err = nil
+			if msg.deletedCount == 1 {
+				m.statusMessage = fmt.Sprintf("✓ Deleted folder '%s' (1 item)", msg.foldername)
+			} else {
+				m.statusMessage = fmt.Sprintf("✓ Deleted folder '%s' (%d items)", msg.foldername, msg.deletedCount)
+			}
+			// Refresh the directory to remove the deleted folder
+			return m, m.loadObjects()
+		}
+		return m, nil
+
+	case batchDeletedMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.err = msg.err
+			m.statusMessage = ""
+		} else {
+			m.err = nil
+			if msg.failedCount > 0 {
+				m.statusMessage = fmt.Sprintf("✓ Deleted %d items (%d failed)", msg.deletedCount, msg.failedCount)
+			} else {
+				if msg.deletedCount == 1 {
+					m.statusMessage = "✓ Deleted 1 item successfully"
+				} else {
+					m.statusMessage = fmt.Sprintf("✓ Deleted %d items successfully", msg.deletedCount)
+				}
+			}
+			// Clear selections after successful batch deletion
+			m.selectedFiles = []string{}
+			// Refresh the directory to remove the deleted items
+			return m, m.loadObjects()
+		}
+		return m, nil
+
 	case fileCopiedMsg:
 		m.loading = false
 		if msg.err != nil {
@@ -408,6 +461,8 @@ func (m Model) updateBrowser(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.loading = true
 				// Clear directory stats cache when navigating to ensure fresh calculations
 				m.dirStatsCache = make(map[string]DirStats)
+				// Clear selections when navigating to different directory
+				m.selectedFiles = []string{}
 				return m, m.loadObjects()
 			} else {
 				// Preview file
@@ -427,6 +482,8 @@ func (m Model) updateBrowser(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.loading = true
 			// Clear directory stats cache when navigating to ensure fresh calculations
 			m.dirStatsCache = make(map[string]DirStats)
+			// Clear selections when navigating to different directory
+			m.selectedFiles = []string{}
 			return m, m.loadObjects()
 		}
 
@@ -462,10 +519,25 @@ func (m Model) updateBrowser(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.uploadFilePrompt()
 
 	case "x":
-		// Delete selected file (with confirmation)
-		if len(m.objects) > 0 {
+		// Delete selected items or current item (with confirmation)
+		if len(m.selectedFiles) > 0 {
+			// Delete all selected items
+			m.confirmAction = "delete_selected"
+			m.confirmTarget = "" // Not used for batch delete
+			m.confirmData = append([]string{}, m.selectedFiles...) // Copy selected files
+			m.viewMode = ViewConfirm
+			m.err = nil
+			m.statusMessage = ""
+		} else if len(m.objects) > 0 {
+			// Delete current item only
 			selected := m.objects[m.cursor]
-			if !selected.IsDir {
+			if selected.IsDir {
+				m.confirmAction = "delete_folder"
+				m.confirmTarget = selected.Key
+				m.viewMode = ViewConfirm
+				m.err = nil
+				m.statusMessage = ""
+			} else {
 				m.confirmAction = "delete"
 				m.confirmTarget = selected.Key
 				m.viewMode = ViewConfirm
@@ -572,6 +644,47 @@ func (m Model) updateBrowser(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.cursor = 0
 			}
 			m.updateScroll()
+		}
+
+	case " ":
+		// Toggle selection of current item
+		if len(m.objects) > 0 {
+			selected := m.objects[m.cursor]
+			
+			// Check if item is already selected
+			isSelected := false
+			selectedIndex := -1
+			for i, selectedKey := range m.selectedFiles {
+				if selectedKey == selected.Key {
+					isSelected = true
+					selectedIndex = i
+					break
+				}
+			}
+
+			if isSelected {
+				// Remove from selected files
+				m.selectedFiles = append(m.selectedFiles[:selectedIndex], m.selectedFiles[selectedIndex+1:]...)
+			} else {
+				// Add to selected files
+				m.selectedFiles = append(m.selectedFiles, selected.Key)
+			}
+			m.err = nil
+
+			// Move cursor to next item
+			if m.cursor < len(m.objects)-1 {
+				m.cursor++
+				m.updateScroll()
+			}
+		}
+
+	case "escape":
+		// Clear all selections
+		if len(m.selectedFiles) > 0 {
+			count := len(m.selectedFiles)
+			m.selectedFiles = []string{}
+			m.statusMessage = fmt.Sprintf("✓ Cleared %d selection(s)", count)
+			m.err = nil
 		}
 
 	case "?":
@@ -860,6 +973,12 @@ func (m Model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch m.confirmAction {
 		case "delete":
 			cmd = m.deleteFile(m.confirmTarget)
+		case "delete_folder":
+			cmd = m.deleteFolder(m.confirmTarget)
+		case "delete_selected":
+			if selectedFiles, ok := m.confirmData.([]string); ok {
+				cmd = m.deleteSelectedItems(selectedFiles)
+			}
 		case "download":
 			cmd = m.downloadFile(m.confirmTarget)
 		case "upload":
@@ -906,6 +1025,9 @@ func (m Model) viewBrowser() string {
 	if m.currentPath != "" {
 		title += fmt.Sprintf(" | Path: /%s", m.currentPath)
 	}
+	if len(m.selectedFiles) > 0 {
+		title += fmt.Sprintf(" | Selected: %d item(s)", len(m.selectedFiles))
+	}
 	if len(m.yankedFiles) > 0 {
 		title += fmt.Sprintf(" | Yanked: %d file(s)", len(m.yankedFiles))
 	}
@@ -950,8 +1072,8 @@ func (m Model) viewBrowser() string {
 			dateWidth := 19    // constant width for date column (YYYY-MM-DD HH:MM:SS)
 			
 			// Calculate available space for filename column
-			// Account for: cursor (2), yank indicator (2), spaces between columns (6), size column (8), date column (19)
-			usedWidth := 2 + 2 + 6 + maxSizeWidth + dateWidth
+			// Account for: cursor (2), selection indicator (2), yank indicator (2), spaces between columns (8), size column (8), date column (19)
+			usedWidth := 2 + 2 + 2 + 8 + maxSizeWidth + dateWidth
 			availableWidth := m.width - usedWidth - 10 // Extra margin for borders and centering
 			
 			// Set reasonable bounds for filename width
@@ -980,6 +1102,16 @@ func (m Model) viewBrowser() string {
 				displayName := name
 				if len(name) > maxNameWidth {
 					displayName = name[:maxNameWidth-3] + "..."
+				}
+
+				// Check if item is selected
+				// Always reserve space for selection indicator to maintain consistent alignment
+				selectedIndicator := " " // Default: empty space
+				for _, selectedKey := range m.selectedFiles {
+					if obj.Key == selectedKey {
+						selectedIndicator = lipgloss.NewStyle().Foreground(lipgloss.Color("#ff6600")).Render("●")
+						break
+					}
 				}
 
 				// Check if file is yanked (directories can't be yanked)
@@ -1035,8 +1167,8 @@ func (m Model) viewBrowser() string {
 					styledName = fileStyle.Render(paddedName)
 				}
 
-				// Use consistent format for all items (always has yank indicator space reserved)
-				line := fmt.Sprintf("%s %s %s %s %s", cursor, yankedIndicator, styledName, paddedSize, displayDate)
+				// Use consistent format for all items (always has selection and yank indicator spaces reserved)
+				line := fmt.Sprintf("%s %s %s %s %s %s", cursor, selectedIndicator, yankedIndicator, styledName, paddedSize, displayDate)
 
 				if i == m.cursor {
 					line = selectedStyle.Render(line)
@@ -1339,6 +1471,21 @@ func (m Model) viewConfirm() string {
 	case "delete":
 		title = "Confirm Delete"
 		message = fmt.Sprintf("Are you sure you want to delete '%s'?\n\nThis action cannot be undone.", filename)
+	case "delete_folder":
+		title = "Confirm Delete Folder"
+		message = fmt.Sprintf("Are you sure you want to delete folder '%s' and ALL its contents?\n\nThis will permanently delete all files and subfolders within it.\nThis action cannot be undone.", filename)
+	case "delete_selected":
+		title = "Confirm Delete Selected Items"
+		if selectedFiles, ok := m.confirmData.([]string); ok {
+			count := len(selectedFiles)
+			if count == 1 {
+				message = "Are you sure you want to delete the selected item?\n\nThis action cannot be undone."
+			} else {
+				message = fmt.Sprintf("Are you sure you want to delete %d selected items?\n\nThis will delete all selected files and folders (including their contents).\nThis action cannot be undone.", count)
+			}
+		} else {
+			message = "Are you sure you want to delete the selected items?\n\nThis action cannot be undone."
+		}
 	case "download":
 		title = "Confirm Download"
 		message = fmt.Sprintf("Download '%s' to current directory?", filename)
@@ -1561,6 +1708,116 @@ func (m Model) deleteFile(key string) tea.Cmd {
 		// Get just the filename for display
 		filename := filepath.Base(key)
 		return fileDeletedMsg{filename: filename}
+	})
+}
+
+// deleteSelectedItems deletes all selected items (files and folders)
+func (m Model) deleteSelectedItems(selectedKeys []string) tea.Cmd {
+	return tea.Cmd(func() tea.Msg {
+		deletedCount := 0
+		failedCount := 0
+		var lastError error
+
+		for _, key := range selectedKeys {
+			// Check if this is a directory by looking for it in current objects
+			isDir := false
+			for _, obj := range m.objects {
+				if obj.Key == key && obj.IsDir {
+					isDir = true
+					break
+				}
+			}
+
+			if isDir {
+				// Delete folder and all its contents
+				prefix := key
+				if prefix != "" && !strings.HasSuffix(prefix, "/") {
+					prefix += "/"
+				}
+
+				// List all objects in the folder
+				objects, err := m.s3Client.ListObjects(context.Background(), m.bucket, prefix)
+				if err != nil {
+					failedCount++
+					lastError = err
+					continue
+				}
+
+				// Delete all files in the folder
+				folderDeletedCount := 0
+				for _, obj := range objects {
+					if !obj.IsDir {
+						err := m.s3Client.DeleteObject(context.Background(), m.bucket, obj.Key)
+						if err != nil {
+							failedCount++
+							lastError = err
+						} else {
+							folderDeletedCount++
+						}
+					}
+				}
+				deletedCount += folderDeletedCount
+			} else {
+				// Delete single file
+				err := m.s3Client.DeleteObject(context.Background(), m.bucket, key)
+				if err != nil {
+					failedCount++
+					lastError = err
+				} else {
+					deletedCount++
+				}
+			}
+		}
+
+		return batchDeletedMsg{
+			deletedCount: deletedCount,
+			failedCount:  failedCount,
+			err:          lastError,
+		}
+	})
+}
+
+// deleteFolder deletes a folder and all its contents from S3
+func (m Model) deleteFolder(folderKey string) tea.Cmd {
+	return tea.Cmd(func() tea.Msg {
+		// Ensure folder key ends with /
+		prefix := folderKey
+		if prefix != "" && !strings.HasSuffix(prefix, "/") {
+			prefix += "/"
+		}
+
+		// List all objects in the folder (recursively)
+		objects, err := m.s3Client.ListObjects(context.Background(), m.bucket, prefix)
+		if err != nil {
+			return folderDeletedMsg{err: fmt.Errorf("failed to list folder contents: %w", err)}
+		}
+
+		// Count total items to delete (files only, not directories)
+		var filesToDelete []string
+		for _, obj := range objects {
+			if !obj.IsDir {
+				filesToDelete = append(filesToDelete, obj.Key)
+			}
+		}
+
+		// Delete all files in the folder
+		deletedCount := 0
+		for _, fileKey := range filesToDelete {
+			err := m.s3Client.DeleteObject(context.Background(), m.bucket, fileKey)
+			if err != nil {
+				return folderDeletedMsg{
+					err: fmt.Errorf("failed to delete '%s': %w", filepath.Base(fileKey), err),
+				}
+			}
+			deletedCount++
+		}
+
+		// Get just the folder name for display
+		foldername := filepath.Base(folderKey)
+		return folderDeletedMsg{
+			foldername:   foldername,
+			deletedCount: deletedCount,
+		}
 	})
 }
 
