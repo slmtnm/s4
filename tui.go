@@ -112,6 +112,12 @@ type batchDeletedMsg struct {
 	err          error
 }
 
+type batchDownloadedMsg struct {
+	downloadedCount int
+	failedCount     int
+	err             error
+}
+
 type fileCopiedMsg struct {
 	sourceKey string
 	destKey   string
@@ -367,6 +373,27 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case batchDownloadedMsg:
+		m.loading = false
+		if msg.err != nil {
+			m.err = msg.err
+			m.statusMessage = ""
+		} else {
+			m.err = nil
+			if msg.failedCount > 0 {
+				m.statusMessage = fmt.Sprintf("✓ Downloaded %d items (%d failed)", msg.downloadedCount, msg.failedCount)
+			} else {
+				if msg.downloadedCount == 1 {
+					m.statusMessage = "✓ Downloaded 1 item successfully"
+				} else {
+					m.statusMessage = fmt.Sprintf("✓ Downloaded %d items successfully", msg.downloadedCount)
+				}
+			}
+			// Clear selections after successful batch download
+			m.selectedFiles = []string{}
+		}
+		return m, nil
+
 	case fileCopiedMsg:
 		m.loading = false
 		if msg.err != nil {
@@ -502,8 +529,32 @@ func (m Model) updateBrowser(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 
 	case "d":
-		// Download selected file (with confirmation)
-		if len(m.objects) > 0 {
+		// Download selected items or current item (with confirmation)
+		if len(m.selectedFiles) > 0 {
+			// Download all selected items (only files, skip directories)
+			var filesToDownload []string
+			for _, selectedKey := range m.selectedFiles {
+				// Check if this is a file (not a directory)
+				for _, obj := range m.objects {
+					if obj.Key == selectedKey && !obj.IsDir {
+						filesToDownload = append(filesToDownload, selectedKey)
+						break
+					}
+				}
+			}
+			
+			if len(filesToDownload) > 0 {
+				m.confirmAction = "download_selected"
+				m.confirmTarget = "" // Not used for batch download
+				m.confirmData = filesToDownload
+				m.viewMode = ViewConfirm
+				m.err = nil
+				m.statusMessage = ""
+			} else {
+				m.err = fmt.Errorf("no files selected for download (directories cannot be downloaded)")
+			}
+		} else if len(m.objects) > 0 {
+			// Download current item only
 			selected := m.objects[m.cursor]
 			if !selected.IsDir {
 				m.confirmAction = "download"
@@ -511,6 +562,8 @@ func (m Model) updateBrowser(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.viewMode = ViewConfirm
 				m.err = nil
 				m.statusMessage = ""
+			} else {
+				m.err = fmt.Errorf("cannot download directories")
 			}
 		}
 
@@ -981,6 +1034,10 @@ func (m Model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			}
 		case "download":
 			cmd = m.downloadFile(m.confirmTarget)
+		case "download_selected":
+			if selectedFiles, ok := m.confirmData.([]string); ok {
+				cmd = m.downloadSelectedItems(selectedFiles)
+			}
 		case "upload":
 			if fullPath, ok := m.confirmData.(string); ok {
 				cmd = m.uploadFile(fullPath)
@@ -1489,6 +1546,18 @@ func (m Model) viewConfirm() string {
 	case "download":
 		title = "Confirm Download"
 		message = fmt.Sprintf("Download '%s' to current directory?", filename)
+	case "download_selected":
+		title = "Confirm Download Selected Items"
+		if selectedFiles, ok := m.confirmData.([]string); ok {
+			count := len(selectedFiles)
+			if count == 1 {
+				message = "Download the selected file to current directory?"
+			} else {
+				message = fmt.Sprintf("Download %d selected files to current directory?\n\nDirectories will be skipped (only files can be downloaded).", count)
+			}
+		} else {
+			message = "Download the selected files to current directory?"
+		}
 	case "upload":
 		title = "Confirm Upload"
 		if m.currentPath != "" {
@@ -1817,6 +1886,44 @@ func (m Model) deleteFolder(folderKey string) tea.Cmd {
 		return folderDeletedMsg{
 			foldername:   foldername,
 			deletedCount: deletedCount,
+		}
+	})
+}
+
+// downloadSelectedItems downloads all selected files from S3 to local directory
+func (m Model) downloadSelectedItems(selectedKeys []string) tea.Cmd {
+	return tea.Cmd(func() tea.Msg {
+		downloadedCount := 0
+		failedCount := 0
+		var lastError error
+
+		for _, key := range selectedKeys {
+			// Download the file
+			data, err := m.s3Client.GetObject(context.Background(), m.bucket, key)
+			if err != nil {
+				failedCount++
+				lastError = err
+				continue
+			}
+
+			// Get just the filename from the key
+			filename := filepath.Base(key)
+
+			// Write to local file
+			err = os.WriteFile(filename, data, 0644)
+			if err != nil {
+				failedCount++
+				lastError = fmt.Errorf("failed to write file '%s': %w", filename, err)
+				continue
+			}
+
+			downloadedCount++
+		}
+
+		return batchDownloadedMsg{
+			downloadedCount: downloadedCount,
+			failedCount:     failedCount,
+			err:             lastError,
 		}
 	})
 }
