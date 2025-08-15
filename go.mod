@@ -1,4 +1,4 @@
-module s4
+module github.com/slmtnm/s4
 
 go 1.23.0
 
